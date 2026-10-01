@@ -1,0 +1,596 @@
+---
+title: "Term Paper"
+output:
+  html_document: default
+  pdf_document: default
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+
+```{r}
+#install.packages(c(
+ #"tidyverse","readr","pROC","psych","MatchIt","gridExtra","caret",
+ # "ggpubr","effsize","broom","cobalt","knitr","kableExtra"
+#))
+```
+
+```{r}
+library(tidyverse)
+library(readr)
+library(pROC)
+library(psych)
+library(MatchIt)
+library(gridExtra)
+library(caret)
+library(ggpubr)
+library(effsize)
+library(broom)
+library(cobalt)
+library(knitr)
+library(kableExtra)
+```
+
+```{r}
+df <- read_delim("roc_full_data.csv",
+                 delim = ";",
+                 locale = locale(encoding = "UTF-8"),
+                 na = c("", "NA"))
+
+if ("age " %in% names(df)) df <- df %>% rename(age = `age `)
+
+df <- df %>%
+  mutate(
+    accuracy = as.character(accuracy),
+    accuracy = str_trim(accuracy),
+    accuracy = str_replace_all(accuracy, ",", "."),
+    accuracy = str_replace_all(accuracy, "\\.\\.", "."),
+    accuracy = ifelse(accuracy == "NR", "0", accuracy),
+    accuracy = ifelse(accuracy %in% c("н","с","ф","o","p",
+                                      "n","m","s","c","NA",""),
+                      NA_character_, accuracy),
+    accuracy = suppressWarnings(as.numeric(accuracy)),
+    accuracy = ifelse(!is.na(accuracy) & !accuracy %in% c(0, 0.5, 1),
+                      NA_real_, accuracy)
+  )
+
+df <- df %>% mutate(age = as.numeric(age))
+
+cat("Субтестов:", length(unique(df$subtest)), "\n")
+print(sort(unique(df$subtest)))
+cat("\nПропуски в sex:", sum(is.na(df$sex)), "из", nrow(df), "\n")
+cat("Пропуски в accuracy:", sum(is.na(df$accuracy)), "из", nrow(df), "\n")
+cat("Пропуски в age:", sum(is.na(df$age)), "из", nrow(df), "\n")
+
+df %>% filter(accuracy == 0) %>% nrow()
+```
+
+```{r}
+df %>%
+  count(subtest, group) %>%
+  pivot_wider(names_from = group, values_from = n, values_fill = 0) %>%
+  print(n = Inf)
+
+df %>%
+  distinct(ID, subtest, group) %>%
+  count(subtest, group) %>%
+  pivot_wider(names_from = group, values_from = n, values_fill = 0) %>%
+  print(n = Inf)
+```
+
+
+```{r}
+df_dp <- read_delim("roc_full_disc_prod.csv", delim = ";",
+                    locale = locale(encoding = "UTF-8"), na = c("", "NA"))
+glimpse(df_dp)
+names(df_dp)
+```
+```{r}
+df_dp <- df_dp %>%
+  mutate(
+    across(c(accuracy, coherence, lexicon, grammar, fluency),
+           ~{
+             x <- as.character(.x)
+             x <- str_trim(x)
+             x <- str_replace_all(x, ",", ".")
+             x <- str_replace_all(x, "\\.\\.", ".")
+             x <- ifelse(x == "NR", "0", x)
+             x <- ifelse(x == "NA",
+                         NA_character_, x)
+             suppressWarnings(as.numeric(x))
+           }),
+    age = as.numeric(age)
+  )
+```
+
+```{r}
+sex_lookup <- df %>%
+  select(ID, sex) %>%
+  filter(!is.na(sex)) %>%
+  distinct(ID, .keep_all = TRUE)
+
+df_dp_clean <- df_dp %>%
+  mutate(
+    accuracy = accuracy,
+    accuracy = ifelse(is.nan(accuracy), NA, accuracy)
+  ) %>%
+  transmute(
+    ID,
+    group,
+    subtest  = "discourse production",
+    item     = 1L,
+    age      = as.numeric(age),
+    accuracy
+  ) %>%
+  left_join(sex_lookup, by = "ID")
+
+df_no_dp <- df %>% filter(subtest != "discourse production")
+df <- bind_rows(df_no_dp, df_dp_clean)
+
+cat("После склейки DP: строк =", nrow(df), "\n")
+df %>%
+  filter(subtest == "discourse production") %>%
+  count(group) %>%
+  print()
+```
+
+
+```{r}
+df_sp <- read_delim("roc_full_synt_prod.csv",
+                    delim = ";",
+                    locale = locale(encoding = "UTF-8"),
+                    na = c("", "NA"))
+
+df_sp <- df_sp %>%
+  mutate(across(c(priming, lexicon, other, syntax),
+                ~{
+                  x <- as.character(.x)
+                  x <- str_trim(x)
+                  x <- str_replace_all(x, ",", ".")
+                  x <- str_replace_all(x, "\\.\\.", ".")
+                  x <- ifelse(x == "NR", "0", x)
+                  x <- ifelse(x == "NA",
+                              NA_character_, x)
+                  suppressWarnings(as.numeric(x))
+                }))
+
+if (!"subtest" %in% names(df_sp)) {
+  df_sp <- df_sp %>% mutate(subtest = "sentense production")
+}
+```
+```{r}
+df_sp_clean <- df_sp %>%
+  mutate(
+    accuracy = rowMeans(cbind(priming, lexicon, other, syntax),
+                        na.rm = TRUE),
+    accuracy = ifelse(is.nan(accuracy), NA, accuracy)
+  ) %>%
+  transmute(
+    ID,
+    group,
+    subtest  = "sentence production",
+    item     = 1L,
+    age      = as.numeric(age),
+    accuracy
+  ) %>%
+  left_join(sex_lookup, by = "ID")
+
+df_no_sp <- df %>% filter(subtest != "sentence production")
+df <- bind_rows(df_no_sp, df_sp_clean)
+
+cat("После склейки SP: строк =", nrow(df), "\n")
+df %>%
+  filter(subtest == "sentence production") %>%
+  count(group) %>%
+  print()
+```
+
+```{r}
+df_subj <- df %>%
+  group_by(ID, group, subtest) %>%
+  summarise(
+    score = mean(accuracy, na.rm = TRUE),
+    age   = suppressWarnings(first(na.omit(age))),
+    sex   = suppressWarnings(first(na.omit(sex))),
+    .groups = "drop"
+  ) %>%
+  mutate(score = ifelse(is.nan(score), NA, score))
+
+df_subj %>% count(subtest, sort = TRUE) %>% print(n = Inf)
+df_subj %>% summarise(n_rows = n(), n_ids = n_distinct(ID))
+
+df_subj %>%
+  count(subtest, group) %>%
+  pivot_wider(names_from = group, values_from = n, values_fill = 0) %>%
+  print(n = Inf)
+```
+```{r}
+df_subj %>%
+  group_by(subtest, group) %>%
+  summarise(mean_score = mean(score, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = group, values_from = mean_score) %>%
+  print(n = Inf)
+```
+
+```{r}
+df_subj %>% summarise(
+  n_score_na = sum(is.na(score)),
+  n_sex_na   = sum(is.na(sex)),
+  n_age_na   = sum(is.na(age)),
+  n_total    = n()
+)
+
+df_subj %>% filter(is.na(score)) %>% distinct(ID) %>% nrow()
+
+df_subj %>%
+  filter(is.na(score)) %>%
+  count(ID, sort = TRUE) %>%
+  head(20) %>%
+  print()
+```
+
+
+```{r}
+desc_table <- df_subj %>%
+  filter(!is.na(score), group %in% c("DLD","TD")) %>%
+  group_by(subtest, group) %>%
+  summarise(
+    n      = n(),
+    mean   = mean(score, na.rm = TRUE),
+    sd     = sd(score,   na.rm = TRUE),
+    median = median(score, na.rm = TRUE),
+    iqr    = IQR(score, na.rm = TRUE),
+    .groups = "drop"
+  )
+print(desc_table, n = Inf)
+
+group_tests <- df_subj %>%
+  filter(!is.na(score), group %in% c("DLD","TD")) %>%
+  group_by(subtest) %>%
+  group_modify(~{
+    d <- .x
+    if (length(unique(d$group)) < 2) return(tibble())
+    if (sum(!is.na(d$score[d$group=="DLD"])) < 3 ||
+        sum(!is.na(d$score[d$group=="TD"]))  < 3) return(tibble())
+
+    tt <- tryCatch(t.test(score ~ group, data = d), error = function(e) NULL)
+    mw <- tryCatch(wilcox.test(score ~ group, data = d), error = function(e) NULL)
+    cd <- tryCatch(cohen.d(score ~ group, data = d), error = function(e) NULL)
+
+    tibble(
+      t        = if (!is.null(tt)) unname(tt$statistic) else NA_real_,
+      df       = if (!is.null(tt)) unname(tt$parameter) else NA_real_,
+      p_t      = if (!is.null(tt)) tt$p.value          else NA_real_,
+      p_mw     = if (!is.null(mw)) mw$p.value          else NA_real_,
+      cohens_d = if (!is.null(cd)) unname(cd$estimate) else NA_real_,
+      d_mag    = if (!is.null(cd)) as.character(cd$magnitude) else NA_character_
+    )
+  }) %>%
+  ungroup() %>%
+  mutate(
+    p_t_fdr  = p.adjust(p_t,  method = "BH"),
+    p_mw_fdr = p.adjust(p_mw, method = "BH")
+  )
+print(group_tests, n = Inf)
+```
+
+```{r}
+roc_results <- df_subj %>%
+  filter(!is.na(score), !is.na(age), group %in% c("DLD","TD")) %>%
+  group_by(subtest) %>%
+  group_modify(~{
+    d <- .x
+    if (length(unique(d$group)) < 2) return(tibble())
+    d$group01 <- ifelse(d$group == "DLD", 1, 0)
+    m <- glm(group01 ~ score + age, data = d, family = binomial)
+    d$pred <- predict(m, type = "response")
+    r <- roc(d$group, d$pred,
+             levels = c("TD","DLD"),
+             direction = "<",
+             quiet = TRUE)
+    ci   <- ci.auc(r)
+    best <- coords(r, "best",
+                   ret = c("threshold","sensitivity","specificity",
+                           "ppv","npv","youden"),
+                   best.method = "youden")
+    tibble(
+      AUC         = as.numeric(auc(r)),
+      CI_low      = as.numeric(ci[1]),
+      CI_high     = as.numeric(ci[3]),
+      threshold   = best$threshold,
+      sensitivity = best$sensitivity,
+      specificity = best$specificity,
+      PPV         = best$ppv,
+      NPV         = best$npv,
+      youden      = best$youden,
+      n_DLD       = sum(d$group == "DLD"),
+      n_TD        = sum(d$group == "TD")
+    )
+  }) %>%
+  ungroup() %>%
+  arrange(desc(AUC))
+
+print(roc_results, n = Inf)
+```
+```{r}
+prev <- 0.07
+
+roc_results <- roc_results %>%
+  mutate(
+    PPV_adj = (sensitivity * prev) /
+              (sensitivity * prev + (1 - specificity) * (1 - prev)),
+    NPV_adj = (specificity * (1 - prev)) /
+              (specificity * (1 - prev) + (1 - sensitivity) * prev)
+  )
+print(roc_results %>% select(subtest, AUC, sensitivity, specificity,
+                             PPV_adj, NPV_adj), n = Inf)
+```
+
+
+
+```{r}
+roc_pretty <- roc_results %>%
+  transmute(
+    Subtest  = subtest,
+    AUC      = sprintf("%.2f", AUC),
+    `95% CI` = sprintf("%.2f–%.2f", CI_low, CI_high),
+    Sens     = sprintf("%.2f", sensitivity),
+    Spec     = sprintf("%.2f", specificity),
+    PPV_adj  = sprintf("%.2f", PPV_adj),
+    NPV_adj  = sprintf("%.2f", NPV_adj),
+    `n DLD`  = n_DLD,
+    `n TD`   = n_TD
+  )
+
+roc_pretty %>%
+  kable(
+    caption  = "ROC by Subtest (age-adjusted, prevalence = 0.07)",
+    align    = c("l","c","c","c","c","c","c","c","c"),
+    booktabs = TRUE
+  ) %>%
+  kable_styling(
+    latex_options = c("striped","hold_position"),
+    full_width    = FALSE
+  ) %>%
+  row_spec(0, bold = TRUE)
+```
+
+
+```{r}
+plot_list <- list()
+for (st in unique(df_subj$subtest)) {
+  d <- df_subj %>% filter(subtest == st, !is.na(score), !is.na(age),
+                          group %in% c("DLD","TD"))
+  if (length(unique(d$group)) < 2) next
+  d$group01 <- ifelse(d$group == "DLD", 1, 0)
+  m <- glm(group01 ~ score + age, data = d, family = binomial)
+  d$pred <- predict(m, type = "response")
+  r <- roc(d$group, d$pred, levels = c("TD","DLD"),
+           direction = "<", quiet = TRUE)
+  plot_list[[st]] <- ggroc(r) +
+    ggtitle(paste0(st, " (AUC = ", round(auc(r), 2), ")")) +
+    geom_abline(slope = 1, intercept = 1, linetype = "dashed") +
+    theme_minimal()
+}
+
+ggarrange(plotlist = plot_list[1:4], ncol = 2, nrow = 2)
+ggarrange(plotlist = plot_list[5:8], ncol = 2, nrow = 2)
+ggarrange(plotlist = plot_list[9:length(plot_list)], ncol = 2, nrow = 2)
+```
+
+
+```{r}
+roc_all <- df_subj %>%
+  filter(!is.na(score), !is.na(age), group %in% c("DLD","TD")) %>%
+  group_by(subtest) %>%
+  group_modify(~{
+    d <- .x
+    if (length(unique(d$group)) < 2) return(tibble())
+    d$group01 <- ifelse(d$group == "DLD", 1, 0)
+    m <- glm(group01 ~ score + age, data = d, family = binomial)
+    d$pred <- predict(m, type = "response")
+    r <- roc(d$group, d$pred, levels = c("TD","DLD"),
+             direction = "<", quiet = TRUE)
+    tibble(spec = rev(r$specificities),
+           sens = rev(r$sensitivities))
+  }) %>% ungroup()
+
+ggplot(roc_all, aes(x = 1 - spec, y = sens, color = subtest)) +
+  geom_line(linewidth = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(x = "1 - Specificity", y = "Sensitivity",
+       title = "ROC by Subtest (age-adjusted)") +
+  theme_minimal()
+```
+
+```{r}
+alpha_item <- df %>%
+  filter(!is.na(accuracy),
+         subtest %in% c("noun comprehension","noun production",
+                        "verb comprehension","verb production",
+                        "pseudoword comprehension","pseudoword repetition",
+                        "sentence comprehension","sentence repetition",
+                        "discourse comprehension")) %>%
+  group_by(subtest, group) %>%
+  group_modify(~{
+    wide <- .x %>%
+      select(ID, item, accuracy) %>%
+      pivot_wider(names_from = item, values_from = accuracy)
+    mat <- wide %>% select(-ID) %>% as.data.frame()
+
+    keep <- sapply(mat, function(x) {
+      !all(is.na(x)) && sd(x, na.rm = TRUE) > 0
+    })
+    mat <- mat[, keep, drop = FALSE]
+
+    mat <- mat[complete.cases(mat), , drop = FALSE]
+
+    if (ncol(mat) < 2 || nrow(mat) < 10) {
+      return(tibble(alpha = NA_real_, n_items = ncol(mat), n_subj = nrow(mat)))
+    }
+
+    a <- psych::alpha(mat, warnings = FALSE)
+    tibble(alpha = a$total$raw_alpha,
+           n_items = ncol(mat),
+           n_subj  = nrow(mat))
+  }) %>%
+  ungroup() %>%
+  mutate(
+    alpha   = round(alpha, 3),
+    n_items = as.integer(n_items),
+    n_subj  = as.integer(n_subj)
+  )
+
+print(alpha_item, n = Inf)
+```
+
+```{r}
+alpha_dp <- df_dp %>%
+  filter(!is.na(coherence), !is.na(grammar),
+         !is.na(lexicon), !is.na(fluency)) %>%
+  group_by(group) %>%
+  summarise(
+    alpha   = psych::alpha(
+                as.data.frame(cbind(coherence, grammar, lexicon, fluency)),
+                warnings = FALSE)$total$raw_alpha,
+    n_items = 4L,
+    n_subj  = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(subtest = "discourse production",
+         alpha = round(alpha, 3)) %>%
+  select(subtest, group, alpha, n_items, n_subj)
+
+print(alpha_dp)
+```
+
+```{r}
+df_sp_subj <- df_sp %>%
+  mutate(across(c(priming, lexicon, other, syntax),
+                ~ suppressWarnings(as.numeric(ifelse(. == "NR", 0, .))))) %>%
+  group_by(ID, group) %>%
+  summarise(
+    priming = mean(priming, na.rm = TRUE),
+    lexicon = mean(lexicon, na.rm = TRUE),
+    other   = mean(other,   na.rm = TRUE),
+    syntax  = mean(syntax,  na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(across(c(priming, lexicon, other, syntax),
+                ~ ifelse(is.nan(.x), NA, .x)))
+
+alpha_sp <- df_sp_subj %>%
+  filter(!is.na(priming), !is.na(lexicon),
+         !is.na(other), !is.na(syntax)) %>%
+  group_by(group) %>%
+  summarise(
+    alpha   = psych::alpha(
+                as.data.frame(cbind(priming, lexicon, other, syntax)),
+                warnings = FALSE)$total$raw_alpha,
+    n_items = 4L,
+    n_subj  = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(subtest = "sentence production",
+         alpha = round(alpha, 3)) %>%
+  select(subtest, group, alpha, n_items, n_subj)
+
+print(alpha_sp)
+```
+```{r}
+alpha_all <- bind_rows(alpha_item, alpha_dp, alpha_sp) %>%
+  mutate(
+    alpha   = round(alpha, 3),
+    n_items = as.integer(n_items),
+    n_subj  = as.integer(n_subj)
+  ) %>%
+  filter(!is.na(alpha), n_items >= 5) %>%
+  arrange(subtest, group)
+
+print(alpha_all, n = Inf)
+```
+
+
+```{r}
+desc_table_pretty <- desc_table %>%
+  mutate(
+    M_SD  = sprintf("%.3f (%.3f)", mean, sd),
+    Mdn_IQR = sprintf("%.3f [%.3f–%.3f]", median, iqr - median/2, iqr + median/2)
+  ) %>%
+  select(subtest, group, n, M_SD) %>%
+  pivot_wider(names_from = group,
+              values_from = c(n, M_SD),
+              names_glue = "{.value}_{group}")
+
+desc_table_pretty <- desc_table_pretty %>%
+  select(subtest, n_DLD, n_TD, M_SD_DLD, M_SD_TD) %>%
+  rename(
+    Subtest  = subtest,
+    `n (DLD)` = n_DLD,
+    `n (TD)`  = n_TD,
+    `DLD M (SD)` = M_SD_DLD,
+    `TD M (SD)`  = M_SD_TD
+  )
+
+desc_table_pretty %>%
+  kable(
+    caption = "Descriptive statistics based on subtest and group",
+    align   = c("l","c","c","c","c"),
+    booktabs = TRUE
+  ) %>%
+  kable_styling(
+    latex_options = c("striped","hold_position"),
+    full_width    = FALSE
+  ) %>%
+  row_spec(0, bold = TRUE)
+```
+
+
+```{r}
+group_tests_pretty <- group_tests %>%
+  mutate(
+    t_stat   = sprintf("%.2f", t),
+    df_stat  = sprintf("%.1f", df),
+    p_t_str  = ifelse(p_t_fdr < .001, "< .001", sprintf("%.3f", p_t_fdr)),
+    p_mw_str = ifelse(p_mw_fdr < .001, "< .001", sprintf("%.3f", p_mw_fdr)),
+    d_str    = sprintf("%.2f", cohens_d),
+    d_mag    = case_when(
+      d_mag == "negligible" ~ "negligible",
+      d_mag == "small"      ~ "small",
+      d_mag == "medium"     ~ "medium",
+      d_mag == "large"      ~ "large",
+      TRUE                  ~ d_mag
+    )
+  ) %>%
+  select(subtest, t_stat, df_stat, p_t_str, p_mw_str, d_str, d_mag) %>%
+  rename(
+    Subtest        = subtest,
+    `t`            = t_stat,
+    `df`           = df_stat,
+    `p (t-test, FDR)`   = p_t_str,
+    `p (MW, FDR)`       = p_mw_str,
+    `Cohen's d`    = d_str,
+    `Effect size`  = d_mag
+  )
+
+group_tests_pretty %>%
+  kable(
+    caption = "Comparison of DLD and TD Groups by Subtest",
+    align   = c("l","c","c","c","c","c","l"),
+    booktabs = TRUE
+  ) %>%
+  kable_styling(
+    latex_options = c("striped","hold_position"),
+    full_width    = FALSE
+  ) %>%
+  row_spec(0, bold = TRUE) %>%
+  column_spec(4:5, background = "transparent")
+```
+
+
+
+
+
